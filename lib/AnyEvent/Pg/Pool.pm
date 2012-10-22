@@ -1,5 +1,7 @@
 package AnyEvent::Pg::Pool;
 
+our $VERSION = '0.04';
+
 use strict;
 use warnings;
 use Carp qw(verbose croak);
@@ -28,8 +30,6 @@ sub _debug {
     warn "[$pool c:$connecting/i:$idle/b:$busy|t:$total|d:$delayed]\@${pkg}::$method> @_ at $file line $line\n";
 }
 
-
-
 sub new {
     my ($class, $conninfo, %opts) = @_;
     $conninfo = { %$conninfo } if ref $conninfo;
@@ -39,11 +39,13 @@ sub new {
     my $timeout = delete $opts{timeout} || 30;
     my $on_error = delete $opts{on_error};
     my $on_connect_error = delete $opts{on_connect_error};
+    my $on_transient_error = delete $opts{on_transient_error};
     # my $on_empty_queue = delete $opts{on_empty_queue};
     my $pool = { conninfo => $conninfo,
                  size => $size,
                  on_error => $on_error,
                  on_connect_error => $on_connect_error,
+                 on_transient_error => $on_transient_error,
                  # on_empty_queue => $on_empty_queue,
                  timeout => $timeout,
                  max_conn_retries => $connection_retries,
@@ -79,9 +81,10 @@ sub push_query {
     my $query = \%query;
     my $queue = $pool->{queue};
     push @$queue, $query;
-    $debug and $debug & 8 and $pool->_debug('query pushed into queue, raw queue size is now ' . scalar @$queue);
     AE::postpone { $pool->_check_queue };
-    AnyEvent::Pg::Pool::Watcher->_new($query);
+    my $w = AnyEvent::Pg::Pool::Watcher->_new($query);
+    $debug and $debug & 8 and $pool->_debug('query pushed into queue, raw queue size is now ' . scalar @$queue);
+    return $w;
 }
 
 sub _is_queue_empty {
@@ -99,19 +102,28 @@ sub _is_queue_empty {
 sub _check_queue {
     my $pool = shift;
     my $idle = $pool->{idle};
-    $debug and $debug & 8 and $pool->_debug('checking queue, there are '. (scalar keys %$idle) . ' idle connections');
-    while (!$pool->_is_queue_empty) {
-        $debug and $debug & 8 and $pool->_debug('processing first query from the query');
+    while (1) {
+        $debug and $debug & 8 and $pool->_debug('checking queue, there are '
+                                                . (scalar keys %$idle)
+                                                . ' idle connections, queue size is '
+                                                . (scalar @{$pool->{queue}}));
+        if ($pool->_is_queue_empty) {
+            $debug and $debug & 8 and $pool->_debug('queue is now empty');
+            last;
+        }
+        $debug and $debug & 8 and $pool->_debug('processing first query from the queue');
         unless (%$idle) {
             if ($pool->{dead}) {
                 my $query = shift @{$pool->{queue}};
                 $pool->_maybe_callback($query, 'on_error');
+                $debug and $debug & 8 and $pool->_debug('on_error called for query $query');
                 next;
             }
             $debug and $debug & 8 and $pool->_debug('starting new connection');
             $pool->_start_new_conn;
             return;
         }
+        keys %$idle;
         my ($seq) = each %$idle;
         my $conn = $pool->{conns}{$seq}
             or croak("internal error, pool is corrupted, seq: $seq:\n" . Dumper($pool));
@@ -165,7 +177,7 @@ sub _on_query_done {
     my ($pool, $seq, $conn) = @_;
     my $query = delete $pool->{current}{$seq};
     if (delete $query->{retry}) {
-        $debug and $debug & 8 and "unshifting failed query into queue";
+        $debug and $debug & 8 and $pool->_debug("unshifting failed query into queue");
         $query->{max_retries}--;
         unshift @{$pool->{queue}}, $query;
     }
@@ -203,6 +215,8 @@ sub _start_new_conn {
 sub _on_conn_error {
     my ($pool, $seq, $conn) = @_;
 
+    $pool->_maybe_callback('on_transient_error');
+
     if (my $query = delete $pool->{current}{$seq}) {
         if ($query->{max_retries}-- > 0) {
             undef $query->{watcher};
@@ -235,6 +249,8 @@ sub _on_conn_connect {
 sub _on_conn_connect_error {
     my ($pool, $seq, $conn) = @_;
     $debug and $debug & 8 and $pool->_debug("unable to connect to database");
+
+    $pool->_maybe_callback('on_transient_error');
 
     # the connection object will be removed from the Pool on the
     # on_error callback that will be called just after this one
@@ -384,6 +400,14 @@ When the number of failed reconnection attemps goes over the limit,
 this callback is called. The pool object and the L<AnyEvent::Pg>
 object representing the last failed attempt are passed as arguments.
 
+=item on_transient_error => $callback
+
+The given callback is invoked every time an internal recoverable error
+happens (for instance, on of the pool connections fails or times out).
+
+There is no guarantee about when this callback will be called and how
+many times. It should be considered just a hint.
+
 =back
 
 =item $w = $pool->push_query(%opts)
@@ -403,9 +427,9 @@ same name on L<AnyEvent::Pg> plus the following ones:
 
 =item retry_on_sqlstate => \%states
 
-A hash of sqlstate values that are retryable. When some error happen,
+A hash of sqlstate values that are retryable. When some error happens,
 and the value of sqlstate from the result object has a value on this
-hash, the query is requeued.
+hash, the query is reset and reintroduced on the query.
 
 =item max_retries => $n
 

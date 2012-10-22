@@ -1,6 +1,6 @@
 package AnyEvent::Pg;
 
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
 use 5.010;
 use strict;
@@ -620,7 +620,7 @@ several queries.
 Marks the connection as dead and aborts any queued queries calling the
 C<on_error> callbacks.
 
-=items $adb->queue_size
+=item $adb->queue_size
 
 Returns the number of queries queued for execution.
 
