@@ -1,5 +1,12 @@
 Revision history for Perl extension AnyEvent::Pg.
 
+0.06  Feb 20, 2013
+        - use Method::WeakCallback to create callbacks to itself in
+          order to remove some memory leaks
+        - add tests based on Test::postgresql
+        - empty_query callback could be called too many times due to
+          stacked calls from AE::postpone
+
 0.05  Jan 18, 2013
         - add experimental support for listeners
 
