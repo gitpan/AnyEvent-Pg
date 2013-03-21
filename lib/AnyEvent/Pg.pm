@@ -1,6 +1,6 @@
 package AnyEvent::Pg;
 
-our $VERSION = 0.08;
+our $VERSION = 0.09;
 
 use 5.010;
 use strict;
@@ -16,13 +16,13 @@ $debug ||= 0;
 
 sub _debug {
     my $self = shift;
+    local ($!, $@, $ENV{__DIE__});
     my $state = $self->{state} // '<undef>';
     my $dbc = $self->{dbc} // '<undef>';
     my $fd = $self->{fd} // '<undef>';
-    my $dbc_status = $dbc->status // '<undef>';
+    my $dbc_status = eval { $dbc->status } // '<undef>';
     my ($pkg, $file, $line, $method) = (caller 0);
     $method =~ s/.*:://;
-    local ($ENV{__DIE__}, $@);
     my $error = eval { $self->{dbc}->errorMessage } // '<undef>';
     $error =~ s/\n\s*/|/msg;
     my $r = defined $self->{read_watcher};

@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               AnyEvent-Pg
-version:            0.08
+version:            0.09
 abstract:           Query a PostgreSQL database asynchronously
 author:
     - Salvador Fandino <sfandino@yahoo.com>
