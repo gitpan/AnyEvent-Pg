@@ -1,6 +1,6 @@
 package AnyEvent::Pg::Pool;
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 
 use strict;
 use warnings;
@@ -32,7 +32,7 @@ sub _debug {
 }
 
 my %default = ( connection_retries => 3,
-                connection_dealy => 2,
+                connection_delay => 2,
                 timeout => 30,
                 size => 1 );
 
@@ -64,6 +64,8 @@ sub new {
                  busy => {},
                  idle => {},
                  connecting => {},
+                 initializing => {},
+                 init_queue_ix => {},
                  queue => [],
                  seq => 1,
                  query_seq => 1,
@@ -107,12 +109,34 @@ sub push_query {
     $query{$_} = delete $opts{$_} for qw(on_result on_error on_done query args max_retries);
     $query{seq} = $pool->{query_seq}++;
     my $query = \%query;
-    my $queue = $pool->{queue};
-    push @$queue, $query;
-    AE::postpone { $pool->_check_queue };
-    my $w = AnyEvent::Pg::Pool::QueryWatcher->_new($query);
-    $debug and $debug & 8 and $pool->_debug('query pushed into queue, raw queue size is now ' . scalar @$queue);
-    return $w;
+
+    my $queue = ($opts{initialization} ? ($pool->{init_queue} //= []) : $pool->{queue});
+    if (defined(my $priority = $opts{priority})) {
+        $query{priority} = $priority;
+        # FIXME: improve the search algorithm used here
+        my $i;
+        for ($i = 0; $i < @$queue; $i++) {
+            my $p2 = $queue->[$i]{priority} // last;
+            $p2 >= $priority or last;
+        }
+        splice @$queue, $i, 0, $query;
+        $debug and $debug & 8 and $pool->_debug("query with priority $priority inserted into queue at position $i/$#$queue");
+    }
+    else {
+        push @$queue, $query;
+    }
+
+    if ($opts{initialization}) {
+        AE::postpone { $pool->_check_init_queue_idle };
+        $debug and $debug & 8 and $pool->_debug('initialization query pushed into queue, queue size is now ' . scalar @$queue);
+    }
+    else {
+        AE::postpone { $pool->_check_queue };
+        $debug and $debug & 8 and $pool->_debug('query pushed into queue, raw queue size is now ' . scalar @$queue);
+        return AnyEvent::Pg::Pool::QueryWatcher->_new($query)
+            if defined wantarray;
+    }
+    ()
 }
 
 sub listen {
@@ -152,7 +176,8 @@ sub listen {
     }
 
     $debug and $debug & 8 and $pool->_debug("listener callback for channel $channel registered");
-    AnyEvent::Pg::Pool::ListenerWatcher->_new($callback);
+    return AnyEvent::Pg::Pool::ListenerWatcher->_new($callback)
+        if defined wantarray;
 }
 
 sub _listener_check_callbacks {
@@ -271,6 +296,19 @@ sub _is_queue_empty {
     return 1;
 }
 
+sub _start_query {
+    my ($pool, $seq, $query) = @_;
+    my $conn = $pool->{conns}{$seq}
+        or die("internal error, pool is corrupted, seq: $seq:\n" . Dumper($pool));
+    my $watcher = $conn->push_query(query     => $query->{query},
+                                    args      => $query->{args},
+                                    on_result => weak_method_callback($pool, '_on_query_result', $seq),
+                                    on_done   => weak_method_callback($pool, '_on_query_done',   $seq) );
+    $pool->{current}{$seq} = $query;
+    $query->{watcher} = $watcher;
+    $debug and $debug & 8 and $pool->_debug("query $query started on conn $conn, seq: $seq");
+}
+
 sub _check_queue {
     my $pool = shift;
     my $idle = $pool->{idle};
@@ -297,19 +335,11 @@ sub _check_queue {
         }
         keys %$idle;
         my ($seq) = each %$idle;
-        my $conn = $pool->{conns}{$seq}
-            or die("internal error, pool is corrupted, seq: $seq:\n" . Dumper($pool));
-
         delete $idle->{$seq};
         $pool->{busy}{$seq} = 1;
+
         my $query = shift @{$pool->{queue}};
-        my $watcher = $conn->push_query(query     => $query->{query},
-                                        args      => $query->{args},
-                                        on_result => weak_method_callback($pool, '_on_query_result', $seq),
-                                        on_done   => weak_method_callback($pool, '_on_query_done',   $seq) );
-        $pool->{current}{$seq} = $query;
-        $query->{watcher} = $watcher;
-        $debug and $debug & 8 and $pool->_debug("query $query started on conn $conn, seq: $seq");
+        $pool->_start_query($seq, $query);
     }
     $debug and $debug & 8 and $pool->_debug('queue is empty!');
 }
@@ -345,13 +375,19 @@ sub _on_query_result {
     }
 }
 
+sub _requeue_query {
+    my ($pool, $query) = @_;
+    $query->{priority} = 0 + 'inf';
+    unshift @{$pool->{queue}}, $query;
+}
+
 sub _on_query_done {
     my ($pool, $seq, $conn) = @_;
     my $query = delete $pool->{current}{$seq};
     if (delete $query->{retry}) {
         $debug and $debug & 8 and $pool->_debug("unshifting failed query into queue");
         $query->{max_retries}--;
-        unshift @{$pool->{queue}}, $query;
+        $pool->_requeue_query($query);
     }
     else {
         $pool->_maybe_callback($query, 'on_done', $conn);
@@ -389,22 +425,28 @@ sub _start_new_conn {
 sub _on_conn_error {
     my ($pool, $seq, $conn) = @_;
 
+    # note that failed initialization queries also come over here
     if (my $query = delete $pool->{current}{$seq}) {
         if ($query->{max_retries}-- > 0) {
-            unshift @{$pool->{queue}}, $query;
+            $pool->_requeue_query($query);
         }
         else {
             $pool->_maybe_callback($query, 'on_error', $conn);
         }
     }
+
     if ($debug and $debug & 8) {
-        my @states = grep $pool->{$_}{$seq}, qw(busy idle connecting);
+        my @states = grep $pool->{$_}{$seq}, qw(busy idle connecting initializing);
         $pool->_debug("removing broken connection in state(s!) @states, "
                       . "\$conn: $conn, \$pool->{conns}{$seq}: "
                       . ($pool->{conns}{$seq} // '<undef>'));
     }
-    delete $pool->{busy}{$seq} or delete $pool->{idle}{$seq}
-        or die "internal error, pool is corrupted, seq: $seq\n" . Dumper($pool);
+    delete $pool->{busy}{$seq}
+        or delete $pool->{idle}{$seq}
+            or delete $pool->{initializing}{$seq}
+                or die "internal error, pool is corrupted, seq: $seq\n" . Dumper($pool);
+
+    delete $pool->{init_queue_ix}{$seq};
     delete $pool->{conns}{$seq};
 
     my $listeners = delete $pool->{listeners_by_conn}{$seq};
@@ -415,11 +457,8 @@ sub _on_conn_error {
     else {
         $pool->_maybe_callback('on_transient_error');
 
-
-        if ($listeners and keys %$listeners) {
-            while (my ($channel) = each %$listeners) {
-                $pool->_start_listener($channel);
-            }
+        if ($listeners) {
+            $pool->_start_listener($_) for keys %$listeners;
         }
         else {
             $debug and $debug & 4 and $pool->_debug("connection $seq had no listeners attached: " .
@@ -477,7 +516,7 @@ sub _on_conn_connect_error {
     }
 
     # giving up!
-    $debug and $debug & 8 and $pool->_debug("it has been imposible to connect to the database, giving up!!!");
+    $debug and $debug & 8 and $pool->_debug("it has been impossible to connect to the database, giving up!!!");
     $pool->{dead} = 1;
 
     # processing continues on the on_conn_error callback
@@ -498,17 +537,44 @@ sub _on_delayed_reconnect {
     $pool->_start_new_conn;
 }
 
+sub _check_init_queue_idle {
+    my $pool = shift;
+    my $idle = $pool->{idle};
+    for my $seq (keys %$idle) {
+        delete $idle->{$seq};
+        $pool->_check_init_queue($seq);
+    }
+}
+
+sub _check_init_queue {
+    my ($pool, $seq) = @_;
+    my $init_queue = $pool->{init_queue};
+    no warnings 'uninitialized';
+    return if $pool->{init_queue_ix}{$seq} >= @$init_queue;
+    my $ix = $pool->{init_queue_ix}{$seq}++;
+    my $query = { %{$init_queue->[$ix]} }; # clone
+    $pool->{initializing}{$seq} = 1;
+    $pool->_start_query($seq, $query);
+    1;
+}
+
 sub _on_conn_empty_queue {
     my ($pool, $seq, $conn) = @_;
     $debug and $debug & 8 and $pool->_debug("conn $conn queue is now empty, seq: $seq");
 
     unless (delete $pool->{busy}{$seq} or
-            delete $pool->{connecting}{$seq}) {
+            delete $pool->{connecting}{$seq} or
+            delete $pool->{initializing}{$seq}) {
         if ($debug) {
             $pool->_debug("pool object: \n" . Dumper($pool));
-            die "internal error: empty_queue callback invoked by object not in state busy or connecting, seq: $seq";
+            die "internal error: empty_queue callback invoked by object not in state busy, connecting or initializing, seq: $seq";
         }
     }
+
+    if (defined ($pool->{init_queue})) {
+        $pool->_check_init_queue($seq) and return;
+    }
+
     $pool->{idle}{$seq} = 1;
     $pool->_check_queue;
 }
@@ -571,8 +637,8 @@ AnyEvent::Pg::Pool
   *******************************************************************
 
 This module handles a pool of databases connections, and transparently
-handles reconnection and reposting queries on case of network or
-server errors.
+handles reconnection and reposting queries when network and server
+errors occur.
 
 =head2 API
 
@@ -590,7 +656,7 @@ Accepts the following options:
 
 =item size => $size
 
-Maximun number of database connections that can be simultaneously
+Maximum number of database connections that can be simultaneously
 established with the server.
 
 =item connection_retries => $n
@@ -613,7 +679,7 @@ number of seconds, it is considered dead and closed.
 =item global_timeout => $seconds
 
 When all the connections to the database become broken and it is not
-possible to stablish a new connection for the given time period the
+possible to establish a new connection for the given time period the
 pool is considered dead and the C<on_error> callback will be called.
 
 Note that this timeout is approximate. It is checked every time a new
@@ -628,7 +694,7 @@ is invoked.
 
 =item on_connect_error => $callback
 
-When the number of failed reconnection attemps goes over the limit,
+When the number of failed reconnection attempts goes over the limit,
 this callback is called. The pool object and the L<AnyEvent::Pg>
 object representing the last failed attempt are passed as arguments.
 
@@ -672,10 +738,33 @@ Note that queries are not retried after partial success. For instance,
 when a result object is returned, but then the server decides to abort
 the transaction (this is rare, but can happen from time to time).
 
+=item priority => $n
+
+This option allows to prioritize queries. The pool dispatches first those
+with the highest priority value.
+
+The default priority is -inf.
+
+Queries of equal priority are dispatched in FIFO order.
+
+=item initialization => $bool
+
+When this option is set, the query will be invoked for every database
+connection (both currently existing or created on the future) before
+any other query.
+
+It can be used to set up session parameters. For instance:
+
+  $pool->push_query(initialization => 1,
+                    query => "set session time zone 'UTC'");
+
+Pushing initialization queries does not return a watcher object. Also,
+once pushed, the current API does not allow removing them.
+
 =back
 
 The callbacks for the C<push_query> method receive as arguments the
-pool object, the underlaying L<AnyEvent::Pg> object actually handling
+pool object, the underlying L<AnyEvent::Pg> object actually handling
 the query and the result object when applicable. For instance:
 
     sub on_result_cb {
@@ -694,7 +783,7 @@ the query and the result object when applicable. For instance:
 =item $w = $pool->listen($channel, %opts)
 
 This method allows to subscribe to the given notification channel and
-receive an event everytime another sends a notification (see
+receive an event every time another sends a notification (see
 PostgreSQL NOTIFY/LISTEN documentation).
 
 The module will take care of keeping an active L<AnyEvent::Pg> connection
@@ -709,11 +798,11 @@ The options accepted by the method are as follow:
 
 =item on_notify => $callback
 
-The given callback will be called everytime some client sends a
+The given callback will be called every time some client sends a
 notification for the selected channel.
 
 The arguments to the callback are the pool object, the channel
-selector and any posible data load passed by the client sending the
+selector and any possible data load passed by the client sending the
 notification.
 
 =item on_listener_started => $callback
