@@ -21,4 +21,4 @@ requires:
   AnyEvent: 5.34
   Method::WeakCallback: 0.01
   Pg::PQ: 0.06
-version: 0.11
+version: 0.12
