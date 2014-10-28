@@ -4,7 +4,7 @@
       "Salvador Fandino <sfandino@yahoo.com>"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921",
+   "generated_by" : "ExtUtils::MakeMaker version 6.98, CPAN::Meta::Converter version 2.142060",
    "license" : [
       "unknown"
    ],
@@ -34,10 +34,10 @@
          "requires" : {
             "AnyEvent" : "5.34",
             "Method::WeakCallback" : "0.01",
-            "Pg::PQ" : "0.06"
+            "Pg::PQ" : "0.14"
          }
       }
    },
    "release_status" : "stable",
-   "version" : "0.14"
+   "version" : 0.15
 }
